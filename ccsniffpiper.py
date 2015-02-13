@@ -275,7 +275,7 @@ class CC2531:
     COMMAND_FRAME = 0x00
 #     COMMAND_CHANNEL = ??
 
-    def __init__(self, callback, channel = DEFAULT_CHANNEL):
+    def __init__(self, callback, channel = DEFAULT_CHANNEL, bus = None, address = None):
 
         stats['Captured'] = 0
         stats['Non-Frame'] = 0
@@ -287,7 +287,14 @@ class CC2531:
         self.running = False
 
         try:
-            self.dev = usb.core.find(idVendor=0x0451, idProduct=0x16ae)
+            kwargs = {}
+            kwargs['idVendor'] = 0x0451
+            kwargs['idProduct'] = 0x16ae
+            if not bus is None:
+                kwargs['bus'] = bus
+            if not address is None:
+                kwargs['address'] = address
+            self.dev = usb.core.find( **kwargs )
         except usb.core.USBError:
             raise OSError("Permission denied, you need to add an udev rule for this device", errno=errno.EACCES)
 
@@ -308,6 +315,20 @@ class CC2531:
             time.sleep(0.1)
 
         self.set_channel(channel)
+
+    @classmethod
+    def listInterfaces(cls, bus=None, address=None):
+        try:
+            kwargs = {}
+            kwargs['idVendor'] = 0x0451
+            kwargs['idProduct'] = 0x16ae
+            if not bus is None:
+                kwargs['bus'] = bus
+            if not address is None:
+                kwargs['address'] = address
+            print usb.core.show_devices( **kwargs )
+        except usb.core.USBError:
+            raise OSError("Permission denied, you need to add an udev rule for this device", errno=errno.EACCES)
 
     def __del__(self):
         if self.dev:
@@ -410,6 +431,16 @@ def arg_parser():
                           default = defaults['channel'],
                           help = 'Set the sniffer\'s CHANNEL. Valid range: 11-26. \
                                   (Default: %s)' % (defaults['channel'],))
+    in_group.add_argument('-i', '--interfaces', action = 'store_true',
+                          default = False,
+                          help = 'Get list of available CC2531 interfaces.')
+    in_group.add_argument('-b', '--bus', type = int, action = 'store',
+                          default = None,
+                          help = 'Set specific USB bus number.')
+    in_group.add_argument('-a', '--address', type = int, action = 'store',
+                          default = None,
+                          help = 'Set specific USB bus address.')
+
     out_group = parser.add_argument_group('Output Options')
     out_group.add_argument('-f', '--fifo', action = 'store',
                            default = defaults['out_fifo'],
@@ -514,75 +545,81 @@ if __name__ == '__main__':
             for h in handlers:
                 h.handle(frame)
 
+    if args.interfaces is not False:
+        CC2531.listInterfaces(bus=args.bus, address=args.address)
+    else:
 
-    if args.offline is not True:
-        f = FifoHandler(out_fifo = args.fifo)
-        handlers.append(f)
-    if args.hex_file is not False:
-        handlers.append(HexdumpHandler(args.hex_file))
-    if args.pcap_file is not False:
-        handlers.append(PcapDumpHandler(args.pcap_file))
+        if args.offline is not True:
+            f = FifoHandler(out_fifo = args.fifo)
+            handlers.append(f)
+        if args.hex_file is not False:
+            handlers.append(HexdumpHandler(args.hex_file))
+        if args.pcap_file is not False:
+            handlers.append(PcapDumpHandler(args.pcap_file))
 
-    if args.headless is False:
-        h = StringIO.StringIO()
-        h.write('Commands:\n')
-        h.write('c: Print current RF Channel\n')
-        h.write('n: Trigger new pcap header before the next frame\n')
-        h.write('h,?: Print this message\n')
-        h.write('[11,26]: Change RF channel\n')
-        h.write('s: Start/stop the packet capture\n')
-        h.write('q: Quit')
-        h = h.getvalue()
+        if args.headless is False:
+            h = StringIO.StringIO()
+            h.write('Commands:\n')
+            h.write('c: Print current RF Channel\n')
+            h.write('n: Trigger new pcap header before the next frame\n')
+            h.write('i: List available CC2531 devices\n')
+            h.write('h,?: Print this message\n')
+            h.write('[11,26]: Change RF channel\n')
+            h.write('s: Start/stop the packet capture\n')
+            h.write('q: Quit')
+            h = h.getvalue()
 
-        e = 'Unknown Command. Type h or ? for help'
+            e = 'Unknown Command. Type h or ? for help'
 
-        print h
+            print h
 
-    snifferDev = CC2531(handlerDispatcher, args.channel)
-    try:
+        snifferDev = CC2531(handlerDispatcher, channel=args.channel, bus=args.bus, address=args.address)
+        try:
 
-        while 1:
-            if args.headless is True:
-                snifferDev.start()
-            else:
-                try:
-                    if select.select([sys.stdin, ], [], [], 10.0)[0]:
-                        cmd = sys.stdin.readline().rstrip()
-                        logger.debug('User input: "%s"' % (cmd,))
-                        if cmd in ('h', '?'):
-                            print h
-                        elif cmd == 'c':
-                            # We'll only ever see this if the user asked for it, so we are
-                            # running interactive. Print away
-                            print 'Sniffing in channel: %d' % (snifferDev.get_channel(),)
-                        elif cmd == 'n':
-                            f.triggerNewGlobalHeader()
-                        elif cmd == 'q':
-                            logger.info('User requested shutdown')
-                            sys.exit(0)
-                        elif cmd == 's':
-                            if snifferDev.isRunning():
-                                snifferDev.stop()
+            while 1:
+                if args.headless is True:
+                    snifferDev.start()
+                else:
+                    try:
+                        if select.select([sys.stdin, ], [], [], 10.0)[0]:
+                            cmd = sys.stdin.readline().rstrip()
+                            logger.debug('User input: "%s"' % (cmd,))
+                            if cmd in ('h', '?'):
+                                print h
+                            elif cmd == 'c':
+                                # We'll only ever see this if the user asked for it, so we are
+                                # running interactive. Print away
+                                print 'Sniffing in channel: %d' % (snifferDev.get_channel(),)
+                            elif cmd == 'n':
+                                f.triggerNewGlobalHeader()
+                            elif cmd == 'i':
+                                CC2531.listInterfaces(bus=args.bus, address=args.address)
+                            elif cmd == 'q':
+                                logger.info('User requested shutdown')
+                                sys.exit(0)
+                            elif cmd == 's':
+                                if snifferDev.isRunning():
+                                    snifferDev.stop()
+                                else:
+                                    snifferDev.start()
+                            elif int(cmd) in range(11, 27):
+                                snifferDev.set_channel(int(cmd))
                             else:
-                                snifferDev.start()
-                        elif int(cmd) in range(11, 27):
-                            snifferDev.set_channel(int(cmd))
-                        else:
-                            raise ValueError
-#                    else:
-#                        logger.debug('No user input')
-                except select.error:
-                    logger.warn('Error while trying to read stdin')
-                except ValueError:
-                    print e
-                except UnboundLocalError:
-                    # Raised by command 'n' when -o was specified at command line
-                    pass
+                                raise ValueError
+#                        else:
+#                            logger.debug('No user input')
+                    except select.error:
+                        logger.warn('Error while trying to read stdin')
+                    except ValueError:
+                        print e
+                    except UnboundLocalError:
+                        # Raised by command 'n' when -o was specified at command line
+                        pass
 
-    except (KeyboardInterrupt, SystemExit):
-        logger.info('Shutting down')
-        if snifferDev.isRunning():
-            snifferDev.stop()
-        dump_stats()
-        sys.exit(0)
+        except (KeyboardInterrupt, SystemExit):
+            logger.info('Shutting down')
+            if snifferDev.isRunning():
+                snifferDev.stop()
+            dump_stats()
+            sys.exit(0)
 
