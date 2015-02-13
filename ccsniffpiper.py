@@ -355,33 +355,35 @@ class CC2531:
     def recv(self):
 
         while self.running:
-            bytesteam = self.dev.read(CC2531.DATA_EP, 4096, CC2531.DATA_TIMEOUT)
-#             print "RECV>> %s" % binascii.hexlify(bytesteam)
+            try:
+                bytesteam = self.dev.read(CC2531.DATA_EP, 4096, CC2531.DATA_TIMEOUT)
+#                 print "RECV>> %s" % binascii.hexlify(bytesteam)
 
-            if len(bytesteam) >= 3:
-                (cmd, cmdLen) = struct.unpack_from("<BH", bytesteam)
-                bytesteam = bytesteam[3:]
-                if len(bytesteam) == cmdLen:
-                    # buffer contains the correct number of bytes
-                    if CC2531.COMMAND_FRAME == cmd:
-                        logger.info('Read a frame of size %d' % (cmdLen,))
-                        stats['Captured'] += 1
-                        (timestamp, pktLen) = struct.unpack_from("<IB", bytesteam)
-                        frame = bytesteam[5:]
+                if len(bytesteam) >= 3:
+                    (cmd, cmdLen) = struct.unpack_from("<BH", bytesteam)
+                    bytesteam = bytesteam[3:]
+                    if len(bytesteam) == cmdLen:
+                        # buffer contains the correct number of bytes
+                        if CC2531.COMMAND_FRAME == cmd:
+                            logger.info('Read a frame of size %d' % (cmdLen,))
+                            stats['Captured'] += 1
+                            (timestamp, pktLen) = struct.unpack_from("<IB", bytesteam)
+                            frame = bytesteam[5:]
 
-                        if len(frame) == pktLen:
-                            self.callback(timestamp, frame.tostring())
+                            if len(frame) == pktLen:
+                                self.callback(timestamp, frame.tostring())
+                            else:
+                                logger.warn("Received a frame with incorrect length, pkgLen:%d, len(frame):%d" %(pktLen, len(frame)))
+
+#                         elif cmd == CC2531.COMMAND_CHANNEL:
+#                             logger.info('Received a command response: [%02x %02x]' % (cmd, bytesteam[0]))
+#                             # We'll only ever see this if the user asked for it, so we are
+#                             # running interactive. Print away
+#                             print 'Sniffing in channel: %d' % (bytesteam[0],)
                         else:
-                            logger.warn("Received a frame with incorrect length, pkgLen:%d, len(frame):%d" %(pktLen, len(frame)))
-
-#                     elif cmd == CC2531.COMMAND_CHANNEL:
-#                         logger.info('Received a command response: [%02x %02x]' % (cmd, bytesteam[0]))
-#                         # We'll only ever see this if the user asked for it, so we are
-#                         # running interactive. Print away
-#                         print 'Sniffing in channel: %d' % (bytesteam[0],)
-                    else:
-                        logger.warn("Received a command response with unknown code - CMD:%02x byte:%02x]" % (cmd, bytesteam[0]))
-
+                            logger.warn("Received a command response with unknown code - CMD:%02x byte:%02x]" % (cmd, bytesteam[0]))
+            except:
+                pass
 
     def set_channel(self, channel):
         was_running = self.running
@@ -576,9 +578,11 @@ if __name__ == '__main__':
         snifferDev = CC2531(handlerDispatcher, channel=args.channel, bus=args.bus, address=args.address)
         try:
 
+            if args.headless is True:
+                snifferDev.start()
             while 1:
                 if args.headless is True:
-                    snifferDev.start()
+                    time.sleep(1.0)
                 else:
                     try:
                         if select.select([sys.stdin, ], [], [], 10.0)[0]:
