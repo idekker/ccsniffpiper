@@ -43,7 +43,6 @@
 import argparse
 import os
 import sys
-import select
 import time
 import stat
 import errno
@@ -51,16 +50,20 @@ import StringIO
 import logging.handlers
 import struct
 import threading
+import traceback
 import binascii
 import usb.core
 import usb.util
 from locale import str
+if sys.platform == 'win32':
+    import win32api, win32pipe, win32file
 
 __version__ = '0.0.1'
 
 defaults = {
     'hex_file': 'ccsniffpiper.hexdump',
-    'out_fifo': '/tmp/ccsniffpiper',
+    'out_fifo_unix': '/tmp/ccsniffpiper',
+    'out_fifo_win32': r'\\.\pipe\wireshark',
     'pcap_file': 'ccsniffpiper.pcap',
     'debug_level': 'WARN',
     'log_level': 'INFO',
@@ -134,9 +137,44 @@ class FifoHandler(object):
         self.needs_pcap_hdr = True
         stats['Piped'] = 0
         stats['Not Piped'] = 0
-        self.__create_fifo()
+        self._create_fifo()
 
-    def __create_fifo(self):
+    def _not_piped(self):
+        stats['Not Piped'] += 1
+
+    def _reset_of(self):
+        self.of = None
+        self.needs_pcap_hdr = True
+
+    def triggerNewGlobalHeader(self):
+        self.needs_pcap_hdr = True
+
+    def handle(self, data):
+        if self.of is None:
+            self._open_fifo()
+
+        if self.of is not None:
+            try:
+                if self.needs_pcap_hdr is True:
+                    self._write_fifo(PCAPHelper.writeGlobalHeader())
+                    self.needs_pcap_hdr = False
+                self._write_fifo(data.pcap)
+                logger.debug('Wrote a frame of size %d bytes' % (data.len))
+                stats['Piped'] += 1
+            except IOError as e:
+                if e.errno == errno.EPIPE:
+                    logger.info('Remote end stopped reading')
+                    stats['Not Piped'] += 1
+                    self.of = None
+                    self.needs_pcap_hdr = True
+                else:
+                    raise
+
+class FifoHandlerUnix(FifoHandler):
+    def __init__(self, out_fifo):
+        super( FifoHandlerUnix, self ).__init__( out_fifo )
+
+    def _create_fifo(self):
         try:
             os.mkfifo(self.out_fifo)
             logger.info('Opened FIFO %s' % (self.out_fifo,))
@@ -151,49 +189,92 @@ class FifoHandler(object):
             else:
                 raise
 
-    def __open_fifo(self):
+    def _open_fifo(self):
         try:
             fd = os.open(self.out_fifo, os.O_NONBLOCK | os.O_WRONLY)
             self.of = os.fdopen(fd, 'w')
         except OSError as e:
             if e.errno == errno.ENXIO:
                 logger.warn('Remote end not reading')
-                stats['Not Piped'] += 1
-                self.of = None
-                self.needs_pcap_hdr = True
+                self._not_piped()
+                self._reset_of()
             elif e.errno == errno.ENOENT:
                 logger.error('%s vanished under our feet' % (self.out_fifo,))
                 logger.error('Trying to re-create it')
-                self.__create_fifo_file()
-                self.of = None
-                self.needs_pcap_hdr = True
+                self._create_fifo()
+                self._reset_of()
             else:
                 raise
 
-    def triggerNewGlobalHeader(self):
-        self.needs_pcap_hdr = True
+    def _write_fifo(self, data):
+        try:
+            self.of.write(data)
+            self.of.flush()
+        except IOError as e:
+            if e.errno == errno.EPIPE:
+                logger.info('Remote end stopped reading')
+                self._not_piped()
+                self._reset_of()
+            else:
+                raise
 
-    def handle(self, data):
-        if self.of is None:
-            self.__open_fifo()
+class FifoHandlerWin32(FifoHandler):
+    def __init__(self, out_fifo):
+        self.named_pipe = None
+        super( FifoHandlerWin32, self ).__init__( out_fifo )
 
-        if self.of is not None:
-            try:
-                if self.needs_pcap_hdr is True:
-                    self.of.write(PCAPHelper.writeGlobalHeader())
-                    self.needs_pcap_hdr = False
-                self.of.write(data.pcap)
-                self.of.flush()
-                logger.debug('Wrote a frame of size %d bytes' % (data.len))
-                stats['Piped'] += 1
-            except IOError as e:
-                if e.errno == errno.EPIPE:
-                    logger.info('Remote end stopped reading')
-                    stats['Not Piped'] += 1
-                    self.of = None
-                    self.needs_pcap_hdr = True
-                else:
-                    raise
+    def _create_fifo(self):
+        try:
+            self.named_pipe = win32pipe.CreateNamedPipe( self.out_fifo, win32pipe.PIPE_ACCESS_OUTBOUND, win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_WAIT, 1, 65536, 65536, 300, None )
+            logger.info('Opened FIFO %s' % (self.out_fifo,))
+        except win32api.error, (code, fn, details):
+            if code == 231:
+                logger.warn('FIFO %s exists. Using it' % (self.out_fifo,))
+            else:
+                raise
+        except:
+            logger.error('Failed to connect to pipe')
+            logger.error( traceback.format_exc() )
+            sys.exit(1)
+
+    def _open_fifo(self):
+        try:
+            res = win32pipe.ConnectNamedPipe( self.named_pipe, None )
+            if res != 0 and win32api.GetLastError() != 535:
+                logger.error('Unable to connect to %s: %r' % ( self.out_fifo, win32api.GetLastError() ))
+                self.__reset_of()
+            else:
+                self.of = self.named_pipe
+        except win32api.error, (code, fn, details):
+            if code == 232:
+                logger.error('%s vanished under our feet' % (self.out_fifo,))
+                logger.error('Trying to re-create it')
+                win32pipe.DisconnectNamedPipe( self.named_pipe )
+                self._not_piped()
+                self._reset_of()
+            else:
+                logger.error('Failed to connect to pipe')
+                logger.error( traceback.format_exc() )
+                raise
+        except:
+            logger.error('Failed to connect to pipe')
+            logger.error( traceback.format_exc() )
+            raise
+
+    def _write_fifo(self, data):
+        try:
+            errCode, _ = win32file.WriteFile( self.of, data )
+            win32file.FlushFileBuffers( self.of )
+            if errCode != 0:
+                logger.error('Error writing data to %s: %d' % ( self.out_fifo, errCode ) )
+        except win32api.error, (code, fn, details):
+            if code == 109 or code == 232:
+                logger.warn('Remote end stopped reading')
+                self._not_piped()
+                self._reset_of()
+            else:
+                raise
+
 #####################################
 class PcapDumpHandler(object):
     def __init__(self, filename):
@@ -273,6 +354,7 @@ class CC2531:
     SET_CHAN  = 0xd2 # 0x0d (idx 0) + data)0x00 (idx 1)
 
     COMMAND_FRAME = 0x00
+    COMMAND_HEARTBEAT = 0x01
 #     COMMAND_CHANNEL = ??
 
     def __init__(self, callback, channel = DEFAULT_CHANNEL, bus = None, address = None):
@@ -380,8 +462,10 @@ class CC2531:
 #                             # We'll only ever see this if the user asked for it, so we are
 #                             # running interactive. Print away
 #                             print 'Sniffing in channel: %d' % (bytesteam[0],)
+                        elif cmd == CC2531.COMMAND_HEARTBEAT:
+                            logger.warn("Received a heartbeat command - byte:%02x len:%d]" % (bytesteam[0], cmdLen))
                         else:
-                            logger.warn("Received a command response with unknown code - CMD:%02x byte:%02x]" % (cmd, bytesteam[0]))
+                            logger.warn("Received a command response with unknown code - CMD:%02x byte:%02x len:%d]" % (cmd, bytesteam[0], cmdLen))
             except:
                 pass
 
@@ -444,11 +528,18 @@ def arg_parser():
                           help = 'Set specific USB bus address.')
 
     out_group = parser.add_argument_group('Output Options')
-    out_group.add_argument('-f', '--fifo', action = 'store',
-                           default = defaults['out_fifo'],
-                           help = 'Set FIFO as the named pipe for sending to wireshark. \
-                                   If argument is omitted and -o option is not specified \
-                                   the capture will pipe to: %s' % (defaults['out_fifo'],))
+    if sys.platform == 'win32':
+        out_group.add_argument('-f', '--fifo', action = 'store',
+                               default = defaults['out_fifo_win32'],
+                               help = 'Set FIFO as the named pipe for sending to wireshark. \
+                                       If argument is omitted and -o option is not specified \
+                                       the capture will pipe to: %s' % (defaults['out_fifo_win32'],))
+    else:
+        out_group.add_argument('-f', '--fifo', action = 'store',
+                               default = defaults['out_fifo_unix'],
+                               help = 'Set FIFO as the named pipe for sending to wireshark. \
+                                       If argument is omitted and -o option is not specified \
+                                       the capture will pipe to: %s' % (defaults['out_fifo_unix'],))
     out_group.add_argument('-o', '--offline', action = 'store_true',
                            default = False,
                            help = 'Disables sending the capture to the named pipe.')
@@ -552,7 +643,10 @@ if __name__ == '__main__':
     else:
 
         if args.offline is not True:
-            f = FifoHandler(out_fifo = args.fifo)
+            if sys.platform == 'win32':
+                f = FifoHandlerWin32(out_fifo = args.fifo)
+            else:
+                f = FifoHandlerUnix(out_fifo = args.fifo)
             handlers.append(f)
         if args.hex_file is not False:
             handlers.append(HexdumpHandler(args.hex_file))
@@ -585,35 +679,30 @@ if __name__ == '__main__':
                     time.sleep(1.0)
                 else:
                     try:
-                        if select.select([sys.stdin, ], [], [], 10.0)[0]:
-                            cmd = sys.stdin.readline().rstrip()
-                            logger.debug('User input: "%s"' % (cmd,))
-                            if cmd in ('h', '?'):
-                                print h
-                            elif cmd == 'c':
-                                # We'll only ever see this if the user asked for it, so we are
-                                # running interactive. Print away
-                                print 'Sniffing in channel: %d' % (snifferDev.get_channel(),)
-                            elif cmd == 'n':
-                                f.triggerNewGlobalHeader()
-                            elif cmd == 'i':
-                                CC2531.listInterfaces(bus=args.bus, address=args.address)
-                            elif cmd == 'q':
-                                logger.info('User requested shutdown')
-                                sys.exit(0)
-                            elif cmd == 's':
-                                if snifferDev.isRunning():
-                                    snifferDev.stop()
-                                else:
-                                    snifferDev.start()
-                            elif int(cmd) in range(11, 27):
-                                snifferDev.set_channel(int(cmd))
+                        cmd = sys.stdin.readline().rstrip()
+                        logger.debug('User input: "%s"' % (cmd,))
+                        if cmd in ('h', '?'):
+                            print h
+                        elif cmd == 'c':
+                            # We'll only ever see this if the user asked for it, so we are
+                            # running interactive. Print away
+                            print 'Sniffing in channel: %d' % (snifferDev.get_channel(),)
+                        elif cmd == 'n':
+                            f.triggerNewGlobalHeader()
+                        elif cmd == 'i':
+                            CC2531.listInterfaces(bus=args.bus, address=args.address)
+                        elif cmd == 'q':
+                            logger.info('User requested shutdown')
+                            sys.exit(0)
+                        elif cmd == 's':
+                            if snifferDev.isRunning():
+                                snifferDev.stop()
                             else:
-                                raise ValueError
-#                        else:
-#                            logger.debug('No user input')
-                    except select.error:
-                        logger.warn('Error while trying to read stdin')
+                                snifferDev.start()
+                        elif int(cmd) in range(11, 27):
+                            snifferDev.set_channel(int(cmd))
+                        else:
+                            raise ValueError
                     except ValueError:
                         print e
                     except UnboundLocalError:
