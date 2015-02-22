@@ -89,8 +89,8 @@ class Frame(object):
         self.hex = ''.join('%02x ' % ord(c) for c in self.__macPDUByteArray).rstrip()
 
     def __generate_frame_hdr(self):
-        sec = 0
-        usec = self.timestampUsec
+        sec = self.timestampUsec / (1000 * 1000)
+        usec = self.timestampUsec % (1000 * 1000)
         return struct.pack(Frame.PCAP_FRAME_HDR_FMT,
                            sec, usec, self.len, self.len)
 
@@ -354,7 +354,7 @@ class CC2531:
     SET_CHAN  = 0xd2 # 0x0d (idx 0) + data)0x00 (idx 1)
 
     COMMAND_FRAME = 0x00
-    COMMAND_HEARTBEAT = 0x01
+    COMMAND_SYNC = 0x01
 #     COMMAND_CHANNEL = ??
 
     def __init__(self, callback, channel = DEFAULT_CHANNEL, bus = None, address = None):
@@ -362,6 +362,7 @@ class CC2531:
         stats['Captured'] = 0
         stats['Non-Frame'] = 0
 
+        self.time = 0
         self.dev = None
         self.channel = channel
         self.callback = callback
@@ -419,6 +420,7 @@ class CC2531:
 
     def start(self):
         # start sniffing
+        self.time = int(time.time() * 1000 * 1000)
         self.running = True
         self.dev.ctrl_transfer(CC2531.DIR_OUT, CC2531.SET_START)
         self.thread = threading.Thread(target=self.recv)
@@ -435,6 +437,8 @@ class CC2531:
         return self.running
 
     def recv(self):
+        timestampWraps  = 0
+        lastTimestamp   = 0
 
         while self.running:
             try:
@@ -451,9 +455,14 @@ class CC2531:
                             stats['Captured'] += 1
                             (timestamp, pktLen) = struct.unpack_from("<IB", bytesteam)
                             frame = bytesteam[5:]
+                            if timestamp < lastTimestamp:
+                                timestampWraps = timestampWraps + 1
+                                logger.warn("Timestamp wrapped - timestampWraps:%d" % (timestampWraps))
+                            lastTimestamp = timestamp
+                            syncedTimestamp = (self.time * 32) + ((timestampWraps << 32) | timestamp)
 
                             if len(frame) == pktLen:
-                                self.callback(timestamp, frame.tostring())
+                                self.callback(syncedTimestamp, frame.tostring())
                             else:
                                 logger.warn("Received a frame with incorrect length, pkgLen:%d, len(frame):%d" %(pktLen, len(frame)))
 
@@ -462,8 +471,8 @@ class CC2531:
 #                             # We'll only ever see this if the user asked for it, so we are
 #                             # running interactive. Print away
 #                             print 'Sniffing in channel: %d' % (bytesteam[0],)
-                        elif cmd == CC2531.COMMAND_HEARTBEAT:
-                            logger.warn("Received a heartbeat command - byte:%02x len:%d]" % (bytesteam[0], cmdLen))
+                        elif cmd == CC2531.COMMAND_SYNC:
+                            logger.warn("Received a sync command - sync:%02x" % (bytesteam[0]))
                         else:
                             logger.warn("Received a command response with unknown code - CMD:%02x byte:%02x len:%d]" % (cmd, bytesteam[0], cmdLen))
             except:
